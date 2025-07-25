@@ -21,6 +21,9 @@ class SalesforceManager {
             password: instanceData.password,
             securityToken: instanceData.securityToken,
             apiVersion: instanceData.apiVersion || '59.0',
+            dbType: instanceData.dbType || 'postgresql',
+            dbUri: instanceData.dbUri || '',
+            dbName: instanceData.dbName || '',
             created: new Date().toISOString(),
             lastSync: null,
             status: 'inactive'

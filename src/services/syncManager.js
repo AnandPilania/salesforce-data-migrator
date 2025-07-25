@@ -9,35 +9,32 @@ class SyncManager {
         this.activeSyncs = new Map();
     }
 
-    async manualSync(instanceId, objectName, selectedFields, targetDatabase) {
+    async manualSync(instanceId, objectName, selectedFields) {
         const syncId = uuidv4();
         const startTime = new Date();
-
         try {
+            const instance = await this.salesforceManager.instances.get(instanceId);
+            if (!instance) throw new Error('Instance not found');
+            const { dbType, dbUri, dbName } = instance;
             this.activeSyncs.set(syncId, {
                 id: syncId,
                 instanceId,
                 objectName,
-                targetDatabase,
+                targetDatabase: dbType,
                 status: 'running',
                 startTime,
                 progress: 0
             });
-
-            Logger.info(`Starting manual sync: ${objectName} to ${targetDatabase}`);
-
+            Logger.info(`Starting manual sync: ${objectName} to ${dbType}`);
             const fields = selectedFields.map(f => f.name);
             const records = await this.salesforceManager.bulkQuery(instanceId, objectName, fields);
-
             if (records.length === 0) {
                 throw new Error('No records found to sync');
             }
-
             const processedRecords = records.map(record => {
                 const processed = {};
                 selectedFields.forEach(field => {
                     let value = record[field.name];
-
                     if (value !== null && value !== undefined) {
                         if (field.type === 'datetime' && typeof value === 'string') {
                             value = new Date(value);
@@ -47,29 +44,30 @@ class SyncManager {
                             value = value.toLowerCase() === 'true';
                         }
                     }
-
                     processed[field.name] = value;
                 });
                 return processed;
             });
-
             let result;
-            if (targetDatabase === 'mongodb') {
-                result = await this.databaseManager.insertRecordsMongo(objectName, processedRecords);
-            } else if (targetDatabase === 'postgresql') {
-                result = await this.databaseManager.insertRecordsPostgres(objectName, processedRecords, selectedFields);
+            const objectSchema = { instanceId, name: objectName, label: objectName };
+            if (dbType === 'mongodb') {
+                await this.databaseManager.constructor.upsertObjectSchemaMongo(dbUri, dbName, objectSchema);
+                await this.databaseManager.constructor.upsertFieldSchemaMongo(dbUri, dbName, selectedFields.map(f => ({ ...f, objectName })));
+                result = await this.databaseManager.constructor.insertRecordsMongo(dbUri, dbName, objectName, processedRecords);
+            } else if (dbType === 'postgresql') {
+                await this.databaseManager.constructor.upsertObjectSchemaPostgres(dbUri, dbName, objectSchema);
+                await this.databaseManager.constructor.upsertFieldSchemaPostgres(dbUri, dbName, selectedFields.map(f => ({ ...f, objectName })));
+                result = await this.databaseManager.constructor.insertRecordsPostgres(dbUri, dbName, objectName, processedRecords, selectedFields);
             } else {
-                throw new Error(`Unsupported target database: ${targetDatabase}`);
+                throw new Error(`Unsupported target database: ${dbType}`);
             }
-
             const endTime = new Date();
             const duration = endTime - startTime;
-
             const syncResult = {
                 id: syncId,
                 instanceId,
                 objectName,
-                targetDatabase,
+                targetDatabase: dbType,
                 status: 'completed',
                 startTime,
                 endTime,
@@ -79,20 +77,17 @@ class SyncManager {
                 recordsUpdated: result.modifiedCount || 0,
                 fields: selectedFields.map(f => f.name)
             };
-
             this.syncHistory.set(syncId, syncResult);
             this.activeSyncs.delete(syncId);
-
             Logger.info(`Manual sync completed: ${objectName} - ${processedRecords.length} records processed`);
             return syncResult;
-
         } catch (error) {
             const endTime = new Date();
             const syncResult = {
                 id: syncId,
                 instanceId,
                 objectName,
-                targetDatabase,
+                targetDatabase: 'unknown',
                 status: 'failed',
                 startTime,
                 endTime,
@@ -102,10 +97,8 @@ class SyncManager {
                 recordsInserted: 0,
                 recordsUpdated: 0
             };
-
             this.syncHistory.set(syncId, syncResult);
             this.activeSyncs.delete(syncId);
-
             Logger.error(`Manual sync failed for ${objectName}:`, error);
             throw error;
         }
@@ -114,47 +107,42 @@ class SyncManager {
     async scheduledSync(scheduleConfig) {
         const syncId = uuidv4();
         const startTime = new Date();
-
         try {
+            const instance = await this.salesforceManager.instances.get(scheduleConfig.instanceId);
+            if (!instance) throw new Error('Instance not found');
+            const { dbType, dbUri, dbName } = instance;
             this.activeSyncs.set(syncId, {
                 id: syncId,
                 instanceId: scheduleConfig.instanceId,
                 objectName: scheduleConfig.objectName,
-                targetDatabase: scheduleConfig.targetDatabase,
+                targetDatabase: dbType,
                 status: 'running',
                 startTime,
                 progress: 0,
                 scheduled: true
             });
-
-            Logger.info(`Starting scheduled sync: ${scheduleConfig.objectName} to ${scheduleConfig.targetDatabase}`);
-
+            Logger.info(`Starting scheduled sync: ${scheduleConfig.objectName} to ${dbType}`);
             const fields = scheduleConfig.fields.map(f => f.name);
             let query = scheduleConfig.query || '';
-
             if (scheduleConfig.incrementalField && scheduleConfig.lastSyncTime) {
                 const lastSync = new Date(scheduleConfig.lastSyncTime).toISOString();
                 query = query ? `${query} AND ${scheduleConfig.incrementalField} > ${lastSync}` : `${scheduleConfig.incrementalField} > ${lastSync}`;
             }
-
             const records = await this.salesforceManager.queryRecords(
                 scheduleConfig.instanceId,
                 scheduleConfig.objectName,
                 fields,
                 query
             );
-
             if (records.length === 0) {
                 Logger.info(`No new records found for scheduled sync: ${scheduleConfig.objectName}`);
                 this.activeSyncs.delete(syncId);
                 return { recordsProcessed: 0, recordsInserted: 0 };
             }
-
             const processedRecords = records.map(record => {
                 const processed = {};
                 scheduleConfig.fields.forEach(field => {
                     let value = record[field.name];
-
                     if (value !== null && value !== undefined) {
                         if (field.type === 'datetime' && typeof value === 'string') {
                             value = new Date(value);
@@ -164,29 +152,30 @@ class SyncManager {
                             value = value.toLowerCase() === 'true';
                         }
                     }
-
                     processed[field.name] = value;
                 });
                 return processed;
             });
-
             let result;
-            if (scheduleConfig.targetDatabase === 'mongodb') {
-                result = await this.databaseManager.insertRecordsMongo(scheduleConfig.objectName, processedRecords);
-            } else if (scheduleConfig.targetDatabase === 'postgresql') {
-                result = await this.databaseManager.insertRecordsPostgres(scheduleConfig.objectName, processedRecords, scheduleConfig.fields);
+            const objectSchema = { instanceId: scheduleConfig.instanceId, name: scheduleConfig.objectName, label: scheduleConfig.objectName };
+            if (dbType === 'mongodb') {
+                await this.databaseManager.constructor.upsertObjectSchemaMongo(dbUri, dbName, objectSchema);
+                await this.databaseManager.constructor.upsertFieldSchemaMongo(dbUri, dbName, scheduleConfig.fields.map(f => ({ ...f, objectName: scheduleConfig.objectName })));
+                result = await this.databaseManager.constructor.insertRecordsMongo(dbUri, dbName, scheduleConfig.objectName, processedRecords);
+            } else if (dbType === 'postgresql') {
+                await this.databaseManager.constructor.upsertObjectSchemaPostgres(dbUri, dbName, objectSchema);
+                await this.databaseManager.constructor.upsertFieldSchemaPostgres(dbUri, dbName, scheduleConfig.fields.map(f => ({ ...f, objectName: scheduleConfig.objectName })));
+                result = await this.databaseManager.constructor.insertRecordsPostgres(dbUri, dbName, scheduleConfig.objectName, processedRecords, scheduleConfig.fields);
             } else {
-                throw new Error(`Unsupported target database: ${scheduleConfig.targetDatabase}`);
+                throw new Error(`Unsupported target database: ${dbType}`);
             }
-
             const endTime = new Date();
             const duration = endTime - startTime;
-
             const syncResult = {
                 id: syncId,
                 instanceId: scheduleConfig.instanceId,
                 objectName: scheduleConfig.objectName,
-                targetDatabase: scheduleConfig.targetDatabase,
+                targetDatabase: dbType,
                 status: 'completed',
                 startTime,
                 endTime,
@@ -197,24 +186,17 @@ class SyncManager {
                 scheduled: true,
                 scheduleId: scheduleConfig.id
             };
-
             this.syncHistory.set(syncId, syncResult);
             this.activeSyncs.delete(syncId);
-
             Logger.info(`Scheduled sync completed: ${scheduleConfig.objectName} - ${processedRecords.length} records processed`);
-            return {
-                recordsProcessed: processedRecords.length,
-                recordsInserted: result.upsertedCount || 0,
-                recordsUpdated: result.modifiedCount || 0
-            };
-
+            return syncResult;
         } catch (error) {
             const endTime = new Date();
             const syncResult = {
                 id: syncId,
                 instanceId: scheduleConfig.instanceId,
                 objectName: scheduleConfig.objectName,
-                targetDatabase: scheduleConfig.targetDatabase,
+                targetDatabase: 'unknown',
                 status: 'failed',
                 startTime,
                 endTime,
@@ -226,10 +208,8 @@ class SyncManager {
                 scheduled: true,
                 scheduleId: scheduleConfig.id
             };
-
             this.syncHistory.set(syncId, syncResult);
             this.activeSyncs.delete(syncId);
-
             Logger.error(`Scheduled sync failed for ${scheduleConfig.objectName}:`, error);
             throw error;
         }

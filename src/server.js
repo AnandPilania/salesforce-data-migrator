@@ -60,9 +60,67 @@ app.delete('/api/instances/:id', async (req, res) => {
     }
 });
 
+app.post('/api/instances/test', async (req, res) => {
+    const { loginUrl, username, password, securityToken, apiVersion, dbType, dbUri, dbName } = req.body;
+    let salesforceOk = false, dbOk = false, salesforceError = null, dbError = null;
+    
+    try {
+        const jsforce = require('jsforce');
+        const conn = new jsforce.Connection({ loginUrl, version: apiVersion });
+        await conn.login(username, password + (securityToken || ''));
+        salesforceOk = true;
+    } catch (err) {
+        salesforceError = err.message;
+    }
+    
+    try {
+        if (dbType === 'mongodb') {
+            const { MongoClient } = require('mongodb');
+            const client = new MongoClient(dbUri);
+            await client.connect();
+            await client.db(dbName).command({ ping: 1 });
+            await client.close();
+            dbOk = true;
+        } else if (dbType === 'postgresql') {
+            const { Pool } = require('pg');
+            const { URL } = require('url');
+            const uri = new URL(dbUri);
+
+            const pool = new Pool({
+                user: uri.username,
+                password: uri.password,
+                host: uri.hostname,
+                port: uri.port || 5432,
+                database: dbName,
+                ssl: uri.searchParams.get('sslmode') === 'require'
+            });
+            
+            const client = await pool.connect();
+            await client.query('SELECT 1');
+            await client.release();
+            await pool.end();
+            dbOk = true;
+        } else {
+            dbError = 'Unsupported dbType';
+        }
+    } catch (err) {
+        dbError = err.message;
+    }
+    res.json({ salesforce: salesforceOk, db: dbOk, salesforceError, dbError });
+});
+
+// Update /api/instances/:id/test to use the same logic
 app.post('/api/instances/:id/test', async (req, res) => {
     try {
-        const result = await salesforceManager.testConnection(req.params.id);
+        const instance = (await salesforceManager.getInstances()).find(i => i.id === req.params.id);
+        if (!instance) throw new Error('Instance not found');
+        // Reuse the logic from above
+        const testRes = await fetch('http://localhost:' + PORT + '/api/instances/test', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(instance)
+        });
+        const result = await testRes.json();
         res.json(result);
     } catch (error) {
         Logger.error('Error testing connection:', error);
