@@ -1,18 +1,14 @@
 import React, { useState } from 'react';
 import { Plus, Edit, Trash2, CheckCircle } from 'lucide-react';
-import StatusIcon from '../components/StatusIcon';
-import { formatDate, formatDuration } from '../utils/format';
-
-const API_BASE = '/api';
-
+import { apiFetch } from '../utils/api';
 const InstancesTab = ({ instances, onReload }) => {
   const [showForm, setShowForm] = useState(false);
   const [editingInstance, setEditingInstance] = useState(null);
   const [formData, setFormData] = useState({
     name: '',
     loginUrl: 'https://test.salesforce.com',
-    username: 'sfdcadmin.airbus@niit.com.srt',
-    password: 'XWUu@KXB2Brc#yc1YtZSn1',
+    username: '',
+    password: '',
     securityToken: '',
     apiVersion: '59.0',
     dbType: 'postgresql',
@@ -22,6 +18,7 @@ const InstancesTab = ({ instances, onReload }) => {
   const [testingConnection, setTestingConnection] = useState(false);
   const [testResult, setTestResult] = useState(null);
   const [formErrors, setFormErrors] = useState({});
+  const [rowTesting, setRowTesting] = useState({});
 
   const uriRegex = {
     postgresql: /^postgres(?:ql)?:\/\/([^:@]+)(:[^@]*)?@([^:/]+)(:\d+)?$/i,
@@ -50,12 +47,10 @@ const InstancesTab = ({ instances, onReload }) => {
     setTestingConnection(true);
     setTestResult(null);
     try {
-      const response = await fetch('/api/instances/test', {
+      const result = await apiFetch('/api/instances/test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(formData)
       });
-      const result = await response.json();
       setTestResult(result);
     } catch (error) {
       setTestResult({ salesforce: false, db: false, salesforceError: '', dbError: error.message });
@@ -73,15 +68,10 @@ const InstancesTab = ({ instances, onReload }) => {
         : `${API_BASE}/instances`;
       const method = editingInstance ? 'PUT' : 'POST';
 
-      const response = await fetch(url, {
+      await apiFetch(url, {
         method,
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(formData)
       });
-
-      if (!response.ok) {
-        throw new Error(await response.text());
-      }
 
       setShowForm(false);
       setEditingInstance(null);
@@ -122,10 +112,7 @@ const InstancesTab = ({ instances, onReload }) => {
   const handleDelete = async (id) => {
     if (confirm('Are you sure you want to delete this instance?')) {
       try {
-        const response = await fetch(`${API_BASE}/instances/${id}`, { method: 'DELETE' });
-        if (!response.ok) {
-          throw new Error(await response.text());
-        }
+        await apiFetch(`${API_BASE}/instances/${id}`, { method: 'DELETE' });
         onReload();
       } catch (error) {
         console.error('Error deleting instance:', error);
@@ -140,6 +127,25 @@ const InstancesTab = ({ instances, onReload }) => {
       ...prev,
       [name]: value
     }));
+  };
+
+  const testConnection = async (instanceId) => {
+    setRowTesting(prev => ({ ...prev, [instanceId]: true }));
+    try {
+      const result = await apiFetch(`/api/instances/${instanceId}/test`, { method: 'POST' });
+      let msg = '';
+      if (result.error) {
+        msg = `Error: ${result.error}`;
+      } else {
+        msg = `Salesforce: ${result.salesforce ? 'Connected' : 'Failed'}${result.salesforceError ? ' (' + result.salesforceError + ')' : ''}\n` +
+              `Database: ${result.db ? 'Connected' : 'Failed'}${result.dbError ? ' (' + result.dbError + ')' : ''}`;
+      }
+      alert(msg);
+    } catch (error) {
+      alert('Test connection failed: ' + error.message);
+    } finally {
+      setRowTesting(prev => ({ ...prev, [instanceId]: false }));
+    }
   };
 
   return (
@@ -359,11 +365,11 @@ const InstancesTab = ({ instances, onReload }) => {
                     <div className="flex space-x-2">
                       <button
                         onClick={() => testConnection(instance.id)}
-                        disabled={testingConnection}
+                        disabled={!!rowTesting[instance.id]}
                         className="text-green-600 hover:text-green-800 disabled:text-gray-400"
                         title="Test Connection"
                       >
-                        {testingConnection ? (
+                        {rowTesting[instance.id] ? (
                           <div className="h-4 w-4 border-2 border-green-600 border-t-transparent rounded-full animate-spin" />
                         ) : (
                           <CheckCircle className="h-4 w-4" />
@@ -399,4 +405,4 @@ const InstancesTab = ({ instances, onReload }) => {
   );
 };
 
-export default InstancesTab; 
+export default InstancesTab;

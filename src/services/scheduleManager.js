@@ -3,14 +3,19 @@ const { v4: uuidv4 } = require('uuid');
 const Logger = require('../utils/logger');
 
 class ScheduleManager {
-    constructor(syncManager) {
+    constructor(syncManager, databaseManager) {
         this.syncManager = syncManager;
+        this.databaseManager = databaseManager;
         this.schedules = new Map();
         this.cronJobs = new Map();
     }
 
     async init() {
-        Logger.info('Schedule Manager initialized');
+        const all = await this.databaseManager.getAllSchedules();
+        for (const schedule of all) {
+            this.schedules.set(schedule.id, schedule);
+        }
+        Logger.info(`Loaded ${all.length} schedules from DB`);
     }
 
     async getSchedules() {
@@ -25,7 +30,7 @@ class ScheduleManager {
             objectName: scheduleData.objectName,
             fields: scheduleData.fields,
             targetDatabase: scheduleData.targetDatabase,
-            cronExpression: scheduleData.cronExpression,
+            cronExpression: scheduleData.pattern,
             query: scheduleData.query || '',
             incrementalField: scheduleData.incrementalField || null,
             enabled: scheduleData.enabled !== false,
@@ -35,13 +40,11 @@ class ScheduleManager {
             nextRun: null,
             status: 'inactive'
         };
-
         this.schedules.set(schedule.id, schedule);
-
+        await this.databaseManager.saveSchedule(schedule);
         if (schedule.enabled) {
             await this.startSchedule(schedule.id);
         }
-
         Logger.info(`Added schedule: ${schedule.name}`);
         return schedule;
     }
@@ -51,19 +54,17 @@ class ScheduleManager {
         if (!schedule) {
             throw new Error('Schedule not found');
         }
-
         const wasEnabled = schedule.enabled;
+        updates.cronExpression = updates.pattern;
         Object.assign(schedule, updates, { updated: new Date().toISOString() });
-
         if (wasEnabled) {
             await this.stopSchedule(id);
         }
-
         if (schedule.enabled) {
             await this.startSchedule(id);
         }
-
         this.schedules.set(id, schedule);
+        await this.databaseManager.saveSchedule(schedule);
         Logger.info(`Updated schedule: ${schedule.name}`);
         return schedule;
     }
@@ -73,9 +74,9 @@ class ScheduleManager {
         if (!schedule) {
             throw new Error('Schedule not found');
         }
-
         await this.stopSchedule(id);
         this.schedules.delete(id);
+        await this.databaseManager.deleteSchedule(id);
         Logger.info(`Deleted schedule: ${schedule.name}`);
     }
 
@@ -106,7 +107,13 @@ class ScheduleManager {
         }
 
         if (this.cronJobs.has(id)) {
-            this.cronJobs.get(id).destroy();
+            const job = this.cronJobs.get(id);
+
+            if (job && typeof job.stop === 'function') {
+                job.stop();
+            }
+
+            this.cronJobs.delete(id);
         }
 
         try {
@@ -140,7 +147,10 @@ class ScheduleManager {
         }
 
         if (this.cronJobs.has(id)) {
-            this.cronJobs.get(id).destroy();
+            const job = this.cronJobs.get(id);
+            if (job && typeof job.stop === 'function') {
+                job.stop();
+            }
             this.cronJobs.delete(id);
         }
 

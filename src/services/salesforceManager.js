@@ -1,11 +1,22 @@
 const jsforce = require('jsforce');
 const { v4: uuidv4 } = require('uuid');
 const Logger = require('../utils/logger');
+const DatabaseManager = require('./databaseManager');
 
 class SalesforceManager {
-    constructor() {
+    constructor(databaseManager) {
         this.instances = new Map();
         this.connections = new Map();
+        this.databaseManager = databaseManager;
+    }
+
+    async init() {
+        // Load all instances from MongoDB on startup
+        const all = await this.databaseManager.getAllInstances();
+        for (const instance of all) {
+            this.instances.set(instance.id, instance);
+        }
+        Logger.info(`Loaded ${all.length} Salesforce instances from DB`);
     }
 
     async getInstances() {
@@ -28,8 +39,8 @@ class SalesforceManager {
             lastSync: null,
             status: 'inactive'
         };
-
         this.instances.set(instance.id, instance);
+        await this.databaseManager.saveInstance(instance);
         Logger.info(`Added Salesforce instance: ${instance.name}`);
         return instance;
     }
@@ -39,14 +50,12 @@ class SalesforceManager {
         if (!instance) {
             throw new Error('Instance not found');
         }
-
         Object.assign(instance, updates, { updated: new Date().toISOString() });
         this.instances.set(id, instance);
-
+        await this.databaseManager.saveInstance(instance);
         if (this.connections.has(id)) {
             this.connections.delete(id);
         }
-
         Logger.info(`Updated Salesforce instance: ${instance.name}`);
         return instance;
     }
@@ -56,9 +65,9 @@ class SalesforceManager {
         if (!instance) {
             throw new Error('Instance not found');
         }
-
         this.instances.delete(id);
         this.connections.delete(id);
+        await this.databaseManager.deleteInstance(id);
         Logger.info(`Deleted Salesforce instance: ${instance.name}`);
     }
 
@@ -210,6 +219,17 @@ class SalesforceManager {
             return records;
         } catch (error) {
             Logger.error(`Error in bulk query for ${objectName}:`, error);
+            throw error;
+        }
+    }
+
+    async countRecords(instanceId, objectName) {
+        try {
+            const conn = await this.getConnection(instanceId);
+            const result = await conn.query(`SELECT COUNT() FROM ${objectName}`);
+            return result.totalSize;
+        } catch (error) {
+            Logger.error(`Error counting records for ${objectName}:`, error);
             throw error;
         }
     }

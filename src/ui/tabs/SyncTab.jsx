@@ -1,11 +1,9 @@
 import React, { useState } from 'react';
 import { Play } from 'lucide-react';
-import StatusIcon from '../components/StatusIcon';
-import { formatDate, formatDuration } from '../utils/format';
+import { formatDate, formatDuration, formatMissingLabel } from '../utils/format';
 import FieldMultiSelect from '../components/FieldMultiSelect';
 import ObjectSelect from '../components/ObjectSelect';
-
-const API_BASE = '/api';
+import { apiFetch } from '../utils/api';
 
 const SyncTab = ({ instances, syncStatus, onReload }) => {
   const [selectedInstance, setSelectedInstance] = useState('');
@@ -21,12 +19,8 @@ const SyncTab = ({ instances, syncStatus, onReload }) => {
     if (!instanceId) return;
     setLoadingObjects(true);
     try {
-      const response = await fetch(`${API_BASE}/instances/${instanceId}/objects`);
-      const data = await response.json();
-      setObjects(data.length > 0 ? data.map((obj) => {
-        obj.label = obj.label.startsWith('__MISSING LABEL__') ? obj.name : obj.label;
-        return obj;
-      }) : data);
+      const data = await apiFetch(`/instances/${instanceId}/objects`);
+      setObjects(formatMissingLabel(data));
     } catch (error) {
       console.error('Error loading objects:', error);
     } finally {
@@ -37,12 +31,8 @@ const SyncTab = ({ instances, syncStatus, onReload }) => {
   const loadFields = async (instanceId, objectName) => {
     if (!instanceId || !objectName) return;
     try {
-      const response = await fetch(`${API_BASE}/instances/${instanceId}/objects/${objectName}/fields`);
-      const data = await response.json();
-      setFields(data.length > 0 ? data.map((field) => {
-        field.label = field.label.startsWith('__MISSING LABEL__') ? field.name : field.label;
-        return field;
-      }) : data);
+      const data = await apiFetch(`/instances/${instanceId}/objects/${objectName}/fields`);
+      setFields(formatMissingLabel(data));
     } catch (error) {
       console.error('Error loading fields:', error);
     }
@@ -71,9 +61,8 @@ const SyncTab = ({ instances, syncStatus, onReload }) => {
     setIsSyncing(true);
     try {
       const selectedFieldObjs = fields.filter(f => selectedFields.includes(f.name));
-      const response = await fetch(`${API_BASE}/sync/manual`, {
+      const result = await apiFetch(`/sync/manual`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           instanceId: selectedInstance,
           objectName: selectedObject,
@@ -81,7 +70,6 @@ const SyncTab = ({ instances, syncStatus, onReload }) => {
           targetDatabase
         })
       });
-      const result = await response.json();
       alert(`Sync started: ${result.jobId}`);
       onReload();
     } catch (error) {
@@ -181,7 +169,7 @@ const SyncTab = ({ instances, syncStatus, onReload }) => {
       <div>
         <h2 className="text-xl font-semibold text-gray-900 mb-4">Sync Status</h2>
 
-        <div className="bg-white rounded-lg shadow overflow-hidden">
+        <div className="bg-white rounded-lg shadow overflow-auto">
           <div className="p-4 border-b">
             <h3 className="font-medium">Active Sync Jobs</h3>
           </div>
@@ -224,7 +212,7 @@ const SyncTab = ({ instances, syncStatus, onReload }) => {
           )}
         </div>
 
-        <div className="bg-white rounded-lg shadow overflow-hidden mt-6">
+        <div className="bg-white rounded-lg shadow overflow-auto mt-6">
           <div className="p-4 border-b">
             <h3 className="font-medium">Sync History</h3>
           </div>
@@ -270,4 +258,4 @@ const SyncTab = ({ instances, syncStatus, onReload }) => {
   );
 };
 
-export default SyncTab; 
+export default SyncTab;

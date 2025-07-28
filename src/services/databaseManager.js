@@ -4,30 +4,25 @@ const Logger = require('../utils/logger');
 
 class DatabaseManager {
     constructor() {
-        this.mongoClient = null;
-        this.mongoDb = null;
-        this.pgPool = null;
+        this.client = null;
+        this.db = null;
+        this.uri = process.env.DB_URI;
+        this.name = process.env.DB_NAME;
     }
 
     async init() {
-        if (process.env.MONGODB_URI) {
-            await this.initMongo();
+        if (!this.uri || !this.name) {
+            throw new Error('DB_URI and DB_NAME must be set in environment');
         }
-
-        if (process.env.POSTGRES_URI) {
-            await this.initPostgres();
-        }
-
-        if (!this.mongoClient && !this.pgPool) {
-            throw new Error('No database connection configured. Set MONGODB_URI or POSTGRES_URI');
-        }
+        await this.initMongo();
     }
 
     async initMongo() {
         try {
-            this.mongoClient = new MongoClient(process.env.MONGODB_URI);
-            await this.mongoClient.connect();
-            this.mongoDb = this.mongoClient.db(process.env.MONGODB_NAME || 'salesforce_sync');
+            const { MongoClient } = require('mongodb');
+            this.client = new MongoClient(this.uri);
+            await this.client.connect();
+            this.db = this.client.db(this.name);
             Logger.info('Connected to MongoDB');
         } catch (error) {
             Logger.error('MongoDB connection failed:', error);
@@ -35,181 +30,57 @@ class DatabaseManager {
         }
     }
 
-    async initPostgres() {
-        try {
-            this.pgPool = new Pool({
-                connectionString: process.env.POSTGRES_URI,
-                max: 20,
-                idleTimeoutMillis: 30000,
-                connectionTimeoutMillis: 2000,
-            });
-
-            await this.pgPool.query('SELECT NOW()');
-            Logger.info('Connected to PostgreSQL');
-        } catch (error) {
-            Logger.error('PostgreSQL connection failed:', error);
-            throw error;
-        }
+    async getCollection(name) {
+        if (!this.db) throw new Error('MongoDB not initialized');
+        return this.db.collection(name);
     }
 
-    static async getMongoDb(dbUri, dbName) {
-        const { MongoClient } = require('mongodb');
-        const client = new MongoClient(dbUri);
-        await client.connect();
-        return { client, db: client.db(dbName) };
+    // Core CRUD for instances
+    async getAllInstances() {
+        const col = await this.getCollection('instances');
+        return await col.find({}).toArray();
+    }
+    async saveInstance(instance) {
+        const col = await this.getCollection('instances');
+        await col.updateOne({ id: instance.id }, { $set: instance }, { upsert: true });
+    }
+    async deleteInstance(id) {
+        const col = await this.getCollection('instances');
+        await col.deleteOne({ id });
     }
 
-    static async getPgPool(dbUri, dbName) {
-        const { Pool } = require('pg');
-        const { URL } = require('url');
-            const uri = new URL(dbUri);
-            const pool = new Pool({
-                user: uri.username,
-                password: uri.password,
-                host: uri.hostname,
-                port: uri.port || 5432,
-                database: dbName,
-                ssl: uri.searchParams.get('sslmode') === 'require'
-            });
-
-        return pool;
+    // Core CRUD for schedules
+    async getAllSchedules() {
+        const col = await this.getCollection('schedules');
+        return await col.find({}).toArray();
+    }
+    async saveSchedule(schedule) {
+        const col = await this.getCollection('schedules');
+        await col.updateOne({ id: schedule.id }, { $set: schedule }, { upsert: true });
+    }
+    async deleteSchedule(id) {
+        const col = await this.getCollection('schedules');
+        await col.deleteOne({ id });
     }
 
-    static async insertRecordsMongo(dbUri, dbName, collectionName, records) {
-        const { client, db } = await DatabaseManager.getMongoDb(dbUri, dbName);
-        try {
-            const collection = db.collection(collectionName.toLowerCase());
-            await collection.createIndex({ Id: 1 }, { unique: true });
-            const operations = records.map(record => ({
-                replaceOne: {
-                    filter: { Id: record.Id },
-                    replacement: {
-                        ...record,
-                        _syncedAt: new Date(),
-                        _source: 'salesforce'
-                    },
-                    upsert: true
-                }
-            }));
-            let result = { upsertedCount: 0, modifiedCount: 0 };
-            if (operations.length > 0) {
-                result = await collection.bulkWrite(operations, { ordered: false });
-            }
-            return result;
-        } finally {
-            await client.close();
-        }
+    // Core CRUD for sync history
+    async getAllSyncHistory() {
+        const col = await this.getCollection('sync_history');
+        return await col.find({}).toArray();
     }
-
-    static async insertRecordsPostgres(dbUri, dbName, tableName, records, fields) {
-        const pool = await DatabaseManager.getPgPool(dbUri, dbName);
-        const client = await pool.connect();
-        try {
-            await DatabaseManager.createTableIfNotExists(client, tableName, fields, records[0]);
-            const columns = Object.keys(records[0]).filter(key => key !== 'attributes');
-            const placeholders = columns.map((_, i) => `$${i + 1}`).join(', ');
-            const conflictColumns = columns.map(col => `${col} = EXCLUDED.${col}`).join(', ');
-            const query = `
-                INSERT INTO ${tableName.toLowerCase()} (${columns.join(', ')}, _synced_at, _source)
-                VALUES (${placeholders}, NOW(), 'salesforce')
-                ON CONFLICT (id) DO UPDATE SET ${conflictColumns}, _synced_at = NOW()
-            `;
-            let insertedCount = 0;
-            for (const record of records) {
-                const values = columns.map(col => record[col]);
-                await client.query(query, values);
-                insertedCount++;
-            }
-            return { upsertedCount: insertedCount };
-        } finally {
-            client.release();
-            await pool.end();
-        }
+    async saveSyncHistory(sync) {
+        const col = await this.getCollection('sync_history');
+        await col.updateOne({ id: sync.id }, { $set: sync }, { upsert: true });
     }
-
-    async createTableIfNotExists(client, tableName, fields, sampleRecord) {
-        const fieldDefinitions = fields.map(field => {
-            let pgType = this.mapSalesforceToPgType(field.type, field.length, field.precision, field.scale);
-            const nullable = field.nillable ? '' : ' NOT NULL';
-            return `${field.name} ${pgType}${nullable}`;
-        }).join(', ');
-
-        const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS ${tableName.toLowerCase()} (
-        ${fieldDefinitions},
-        _synced_at TIMESTAMP DEFAULT NOW(),
-        _source VARCHAR(50) DEFAULT 'salesforce',
-        PRIMARY KEY (id)
-      )
-    `;
-
-        await client.query(createTableQuery);
-
-        const indexQuery = `CREATE INDEX IF NOT EXISTS idx_${tableName.toLowerCase()}_synced_at ON ${tableName.toLowerCase()} (_synced_at)`;
-        await client.query(indexQuery);
-    }
-
-    mapSalesforceToPgType(sfType, length, precision, scale) {
-        switch (sfType.toLowerCase()) {
-            case 'id':
-            case 'reference':
-                return 'VARCHAR(18)';
-            case 'string':
-            case 'textarea':
-            case 'url':
-            case 'email':
-            case 'phone':
-                return length ? `VARCHAR(${Math.min(length, 4000)})` : 'TEXT';
-            case 'picklist':
-            case 'multipicklist':
-                return length ? `VARCHAR(${length})` : 'VARCHAR(255)';
-            case 'boolean':
-                return 'BOOLEAN';
-            case 'int':
-                return 'INTEGER';
-            case 'double':
-            case 'currency':
-            case 'percent':
-                if (precision && scale) {
-                    return `NUMERIC(${precision}, ${scale})`;
-                }
-                return 'NUMERIC';
-            case 'date':
-                return 'DATE';
-            case 'datetime':
-                return 'TIMESTAMP';
-            case 'time':
-                return 'TIME';
-            default:
-                return 'TEXT';
-        }
-    }
-
-    async getRecordCount(database, tableName) {
-        try {
-            if (database === 'mongodb' && this.mongoDb) {
-                const collection = this.mongoDb.collection(tableName.toLowerCase());
-                return await collection.countDocuments();
-            } else if (database === 'postgresql' && this.pgPool) {
-                const result = await this.pgPool.query(`SELECT COUNT(*) FROM ${tableName.toLowerCase()}`);
-                return parseInt(result.rows[0].count);
-            }
-            return 0;
-        } catch (error) {
-            Logger.error(`Error getting record count for ${tableName}:`, error);
-            return 0;
-        }
+    async deleteSyncHistory(id) {
+        const col = await this.getCollection('sync_history');
+        await col.deleteOne({ id });
     }
 
     async close() {
-        if (this.mongoClient) {
-            await this.mongoClient.close();
+        if (this.client) {
+            await this.client.close();
             Logger.info('MongoDB connection closed');
-        }
-
-        if (this.pgPool) {
-            await this.pgPool.end();
-            Logger.info('PostgreSQL connection closed');
         }
     }
 
@@ -220,7 +91,7 @@ class DatabaseManager {
             await client.query(`CREATE TABLE IF NOT EXISTS objects (
                 id SERIAL PRIMARY KEY,
                 instance_id VARCHAR(64),
-                name VARCHAR(255),
+                name VARCHAR(255) UNIQUE,
                 api_name VARCHAR(255),
                 label VARCHAR(255),
                 description TEXT,
@@ -259,7 +130,8 @@ class DatabaseManager {
                 reference_to VARCHAR(255),
                 relationship_label VARCHAR(255),
                 relationship_name VARCHAR(255),
-                last_updated TIMESTAMP DEFAULT NOW()
+                last_updated TIMESTAMP DEFAULT NOW(),
+                UNIQUE (object_name, name)
             )`);
             for (const field of fields) {
                 await client.query(`INSERT INTO fields (object_name, name, label, type, nillable, length, precision, scale, external_id, formula, unique_field, required, visible_lines, value_set, description, reference_to, relationship_label, relationship_name, last_updated)
@@ -273,10 +145,143 @@ class DatabaseManager {
         }
     }
 
+    static mapFieldTypeToPgType(field) {
+        // Basic mapping from Salesforce/JS types to PostgreSQL types
+        switch ((field.type || '').toLowerCase()) {
+            case 'string':
+            case 'id':
+            case 'reference':
+            case 'picklist':
+            case 'email':
+            case 'phone':
+            case 'url':
+                return field.length ? `VARCHAR(${field.length})` : 'VARCHAR(255)';
+            case 'boolean':
+                return 'BOOLEAN';
+            case 'int':
+            case 'integer':
+                return 'INTEGER';
+            case 'double':
+            case 'currency':
+            case 'percent':
+            case 'number':
+                return 'DOUBLE PRECISION';
+            case 'date':
+                return 'DATE';
+            case 'datetime':
+                return 'TIMESTAMP';
+            case 'json':
+            case 'jsonb':
+                return 'JSONB';
+            case 'text':
+            case 'textarea':
+                return 'TEXT';
+            default:
+                return 'TEXT';
+        }
+    }
+
+    static async insertRecordsPostgres(dbUri, dbName, tableName, records, fields) {
+        if (!records || records.length === 0) return { upsertedCount: 0, modifiedCount: 0 };
+        tableName = tableName.toLowerCase();
+        const pool = await DatabaseManager.getPgPool(dbUri, dbName);
+        const client = await pool.connect();
+        try {
+            const columns = fields.sort((a, b) => {
+                if (a.name.toLowerCase() === 'id') return -1;
+                if (b.name.toLowerCase() === 'id') return 1;
+                return 0;
+            }).map(f => f.name.toLowerCase());
+
+            let pk = '';
+            if (tableName === 'fields') {
+                pk = ', PRIMARY KEY (object_name, name)';
+            } else {
+                pk = `, PRIMARY KEY (${columns[0]})`;
+            }
+            const columnDefs = fields.map(f => {
+                const type = DatabaseManager.mapFieldTypeToPgType(f);
+                const nullable = f.nillable === false ? 'NOT NULL' : '';
+                return `"${f.name.toLowerCase()}" ${type} ${nullable}`.trim();
+            }).join(', ');
+
+            await client.query(`DROP TABLE IF EXISTS "${tableName}"`);
+            await client.query(`CREATE TABLE IF NOT EXISTS "${tableName}" (${columnDefs}${pk})`);
+
+            const existingColsRes = await client.query(`SELECT column_name FROM information_schema.columns WHERE table_name = $1`, [tableName]);
+            const existingCols = existingColsRes.rows.map(r => r.column_name.toLowerCase());
+            const missingCols = [];
+
+            for (const field of fields) {
+                const colName = field.name.toLowerCase();
+                if (!existingCols.includes(colName)) {
+                    const colType = DatabaseManager.mapFieldTypeToPgType(field);
+                    const nullable = field.nillable === false ? 'NOT NULL' : '';
+                    missingCols.push(colName);
+                    await client.query(`ALTER TABLE "${tableName}" ADD COLUMN "${colName}" ${colType} ${nullable}`.trim());
+                }
+            }
+            if (missingCols.length > 0) {
+                console.log(`[DB] Table ${tableName} - Existing columns:`, existingCols);
+                console.log(`[DB] Table ${tableName} - Adding missing columns:`, missingCols);
+                await new Promise(r => setTimeout(r, 200));
+            }
+
+            // Convert records to lowercase keys and remove duplicates based on conflict columns
+            let conflictCols = [];
+            if (tableName === 'objects') conflictCols = ['name'];
+            else if (tableName === 'fields') conflictCols = ['object_name', 'name'];
+            else conflictCols = [columns[0]];
+
+            // Create a map to store unique records based on conflict columns
+            const uniqueRecordsMap = new Map();
+            
+            records.forEach(record => {
+                const lowerRecord = {};
+                for (const key in record) {
+                    lowerRecord[key.toLowerCase()] = record[key];
+                }
+                
+                // Create a key based on the conflict columns
+                const recordKey = conflictCols
+                    .map(col => lowerRecord[col])
+                    .join('|');
+                
+                // Keep only the last occurrence of each record
+                uniqueRecordsMap.set(recordKey, lowerRecord);
+            });
+            
+            // Convert back to array
+            const uniqueRecords = Array.from(uniqueRecordsMap.values());
+            
+            // Generate placeholders and values for the query
+            const valuePlaceholders = uniqueRecords.map((_, i) => 
+                `(${columns.map((_, j) => `$${i * columns.length + j + 1}`).join(', ')})`
+            ).join(', ');
+            
+            const values = uniqueRecords.flatMap(record => 
+                columns.map(col => record[col])
+            );
+            
+            console.log(`[DB] Processing ${uniqueRecords.length} unique records out of ${records.length} total records`);
+            const updateSet = columns.filter(col => !conflictCols.includes(col)).map(col => `"${col}" = EXCLUDED."${col}"`).join(', ');
+            const sql = `INSERT INTO "${tableName}" (${columns.map(col => `"${col}"`).join(', ')}) VALUES ${valuePlaceholders} ON CONFLICT (${conflictCols.map(col => `"${col}"`).join(', ')}) DO UPDATE SET ${updateSet}`;
+            console.log('[DB] Final SQL:', sql);
+            console.log('[DB] Values:', values);
+            const result = await client.query(sql, values);
+            return { upsertedCount: result.rowCount, modifiedCount: result.rowCount };
+        } finally {
+            client.release();
+            await pool.end();
+        }
+    }
+
     static async upsertObjectSchemaMongo(dbUri, dbName, objectSchema) {
         const { client, db } = await DatabaseManager.getMongoDb(dbUri, dbName);
         try {
             const objects = db.collection('objects');
+            // Ensure unique index on name
+            await objects.createIndex({ name: 1 }, { unique: true });
             await objects.updateOne(
                 { name: objectSchema.name },
                 { $set: { ...objectSchema, lastUpdated: new Date() } },
@@ -286,11 +291,13 @@ class DatabaseManager {
             await client.close();
         }
     }
-    
+
     static async upsertFieldSchemaMongo(dbUri, dbName, fields) {
         const { client, db } = await DatabaseManager.getMongoDb(dbUri, dbName);
         try {
             const fieldsCol = db.collection('fields');
+            // Ensure unique index on (objectName, name)
+            await fieldsCol.createIndex({ objectName: 1, name: 1 }, { unique: true });
             for (const field of fields) {
                 await fieldsCol.updateOne(
                     { objectName: field.objectName, name: field.name },
@@ -301,6 +308,75 @@ class DatabaseManager {
         } finally {
             await client.close();
         }
+    }
+
+    static async insertRecordsMongo(dbUri, dbName, collectionName, records, fields) {
+        if (!records || records.length === 0) return { upsertedCount: 0, modifiedCount: 0 };
+        const { client, db } = await DatabaseManager.getMongoDb(dbUri, dbName);
+        try {
+            // Create collection if it does not exist
+            const collections = await db.listCollections({ name: collectionName }).toArray();
+            if (collections.length === 0) {
+                await db.createCollection(collectionName);
+            }
+            const col = db.collection(collectionName);
+            // Optionally create unique index if fields suggest one
+            if (fields && fields.length > 0) {
+                let uniqueFields = [];
+                if (collectionName === 'objects') uniqueFields = ['name'];
+                else if (collectionName === 'fields') uniqueFields = ['objectName', 'name'];
+                else uniqueFields = [fields[0].name];
+                // Try to create unique index, ignore error if already exists
+                try {
+                    await col.createIndex(Object.fromEntries(uniqueFields.map(f => [f, 1])), { unique: true });
+                } catch (e) { }
+            }
+            // Upsert each record, ensuring all fields are present and nillable respected
+            let upsertedCount = 0, modifiedCount = 0;
+            for (const record of records) {
+                let filter = {};
+                if (collectionName === 'objects') filter = { name: record.name };
+                else if (collectionName === 'fields') filter = { objectName: record.objectName, name: record.name };
+                else filter = { [fields[0].name]: record[fields[0].name] };
+                // Ensure all fields are present in the upserted document, respect nillable
+                const doc = { ...record };
+                for (const field of fields) {
+                    if (!(field.name in doc)) {
+                        doc[field.name] = field.nillable !== false ? null : undefined;
+                    }
+                }
+                // Remove undefined fields (for non-nillable missing fields)
+                Object.keys(doc).forEach(k => doc[k] === undefined && delete doc[k]);
+                const res = await col.updateOne(filter, { $set: doc }, { upsert: true });
+                if (res.upsertedCount) upsertedCount += res.upsertedCount;
+                if (res.modifiedCount) modifiedCount += res.modifiedCount;
+            }
+            return { upsertedCount, modifiedCount };
+        } finally {
+            await client.close();
+        }
+    }
+
+    static async getMongoDb(dbUri, dbName) {
+        const { MongoClient } = require('mongodb');
+        const client = new MongoClient(dbUri);
+        await client.connect();
+        return { client, db: client.db(dbName) };
+    }
+
+    static async getPgPool(dbUri, dbName) {
+        const { Pool } = require('pg');
+        const { URL } = require('url');
+        const uri = new URL(dbUri);
+        const pool = new Pool({
+            user: uri.username,
+            password: uri.password,
+            host: uri.hostname,
+            port: uri.port || 5432,
+            database: dbName,
+            ssl: uri.searchParams.get('sslmode') === 'require'
+        });
+        return pool;
     }
 }
 

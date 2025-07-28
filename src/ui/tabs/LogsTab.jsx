@@ -1,8 +1,6 @@
 import React, { useState } from 'react';
-import StatusIcon from '../components/StatusIcon';
-import { formatDate, formatDuration } from '../utils/format';
-
-const API_BASE = '/api';
+import { formatDate } from '../utils/format';
+import { apiFetch } from '../utils/api';
 
 const LogsTab = ({ logs, onReload }) => {
   const [logLevel, setLogLevel] = useState('all');
@@ -14,8 +12,7 @@ const LogsTab = ({ logs, onReload }) => {
 
   const loadLogs = async () => {
     try {
-      const response = await fetch(`${API_BASE}/logs?limit=${limit}&level=${logLevel}`);
-      const data = await response.json();
+      const data = await apiFetch(`/logs?limit=${limit}&level=${logLevel}`);
       onReload(data);
     } catch (error) {
       console.error('Error loading logs:', error);
@@ -113,4 +110,4 @@ const LogsTab = ({ logs, onReload }) => {
   );
 };
 
-export default LogsTab; 
+export default LogsTab;

@@ -1,5 +1,6 @@
 const { v4: uuidv4 } = require('uuid');
 const Logger = require('../utils/logger');
+const DatabaseManager = require('./databaseManager');
 
 class SyncManager {
     constructor(salesforceManager, databaseManager) {
@@ -7,6 +8,19 @@ class SyncManager {
         this.databaseManager = databaseManager;
         this.syncHistory = new Map();
         this.activeSyncs = new Map();
+    }
+
+    async init() {
+        const all = await this.databaseManager.getAllSyncHistory();
+        for (const sync of all) {
+            this.syncHistory.set(sync.id, sync);
+        }
+        Logger.info(`Loaded ${all.length} sync history records from DB`);
+    }
+
+    async saveSyncResult(syncResult) {
+        this.syncHistory.set(syncResult.id, syncResult);
+        await this.databaseManager.saveSyncHistory(syncResult);
     }
 
     async manualSync(instanceId, objectName, selectedFields) {
@@ -27,6 +41,7 @@ class SyncManager {
             });
             Logger.info(`Starting manual sync: ${objectName} to ${dbType}`);
             const fields = selectedFields.map(f => f.name);
+            console.log({ fields });
             const records = await this.salesforceManager.bulkQuery(instanceId, objectName, fields);
             if (records.length === 0) {
                 throw new Error('No records found to sync');
@@ -77,7 +92,7 @@ class SyncManager {
                 recordsUpdated: result.modifiedCount || 0,
                 fields: selectedFields.map(f => f.name)
             };
-            this.syncHistory.set(syncId, syncResult);
+            await this.saveSyncResult(syncResult);
             this.activeSyncs.delete(syncId);
             Logger.info(`Manual sync completed: ${objectName} - ${processedRecords.length} records processed`);
             return syncResult;
@@ -97,7 +112,7 @@ class SyncManager {
                 recordsInserted: 0,
                 recordsUpdated: 0
             };
-            this.syncHistory.set(syncId, syncResult);
+            await this.saveSyncResult(syncResult);
             this.activeSyncs.delete(syncId);
             Logger.error(`Manual sync failed for ${objectName}:`, error);
             throw error;
@@ -186,7 +201,7 @@ class SyncManager {
                 scheduled: true,
                 scheduleId: scheduleConfig.id
             };
-            this.syncHistory.set(syncId, syncResult);
+            await this.saveSyncResult(syncResult);
             this.activeSyncs.delete(syncId);
             Logger.info(`Scheduled sync completed: ${scheduleConfig.objectName} - ${processedRecords.length} records processed`);
             return syncResult;
@@ -208,7 +223,7 @@ class SyncManager {
                 scheduled: true,
                 scheduleId: scheduleConfig.id
             };
-            this.syncHistory.set(syncId, syncResult);
+            await this.saveSyncResult(syncResult);
             this.activeSyncs.delete(syncId);
             Logger.error(`Scheduled sync failed for ${scheduleConfig.objectName}:`, error);
             throw error;
@@ -216,10 +231,17 @@ class SyncManager {
     }
 
     async getSyncStatus() {
-        const activeList = Array.from(this.activeSyncs.values());
+        const activeList = Array.from(this.activeSyncs.values()).map(job => ({
+            ...job,
+            startedAt: job.startTime ? new Date(job.startTime).toISOString() : undefined
+        }));
         const historyList = Array.from(this.syncHistory.values())
             .sort((a, b) => new Date(b.startTime) - new Date(a.startTime))
-            .slice(0, 50);
+            .slice(0, 50)
+            .map(job => ({
+                ...job,
+                startedAt: job.startTime ? new Date(job.startTime).toISOString() : undefined
+            }));
 
         return {
             active: activeList,

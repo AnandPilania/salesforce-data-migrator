@@ -1,11 +1,33 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Plus, Edit, Trash2, Play, Pause } from 'lucide-react';
-import StatusIcon from '../components/StatusIcon';
-import { formatDate, formatDuration } from '../utils/format';
 import FieldMultiSelect from '../components/FieldMultiSelect';
 import ObjectSelect from '../components/ObjectSelect';
+import { formatMissingLabel } from '../utils/format';
+import { apiFetch } from '../utils/api';
+import cronstrue from 'cronstrue';
 
-const API_BASE = '/api';
+const SCHEDULE_TYPES = [
+  { value: 'hourly', label: 'Hourly (every hour)' },
+  { value: 'everyXMinutes', label: 'Every X minutes' },
+  { value: 'everyXHours', label: 'Every X hours' },
+  { value: 'daily', label: 'Daily at time' },
+  { value: 'alternateDay', label: 'Every N days at time' },
+  { value: 'weekly', label: 'Weekly on day/time' },
+  { value: 'alternateWeek', label: 'Every N weeks (on Monday) at time' },
+  { value: 'monthly', label: 'Monthly on day/time' },
+  { value: 'alternateMonth', label: 'Every N months (on 1st) at time' },
+  { value: 'quarterly', label: 'Quarterly (Jan/Apr/Jul/Oct 1st) at time' },
+  { value: 'yearly', label: 'Yearly (Jan 1st) at time' },
+  { value: 'custom', label: 'Custom cron pattern' }
+];
+
+function autoFormatCronInput(input) {
+  // Auto-insert space after * or / or number if not already spaced
+  return input
+    .replace(/\s+/g, ' ')
+    .replace(/(\*|\d+|\d+\/\d+)(?!\s|$)/g, '$1 ')
+    .trim();
+}
 
 const SchedulesTab = ({ schedules, instances, onReload }) => {
   const [showForm, setShowForm] = useState(false);
@@ -16,20 +38,25 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
     objectName: '',
     fields: [],
     targetDatabase: 'postgres',
-    frequency: 'daily',
+    scheduleType: 'hourly',
     time: '00:00',
+    dayOfWeek: '1',
+    dayOfMonth: '1',
+    customPattern: '',
+    everyX: '15',
+    alternate: '2',
     active: true
   });
   const [objects, setObjects] = useState([]);
   const [fields, setFields] = useState([]);
+  const [editLoading, setEditLoading] = useState(false);
 
   const loadObjects = async (instanceId) => {
     if (!instanceId) return;
     setLoadingObjects(true);
     try {
-      const response = await fetch(`${API_BASE}/instances/${instanceId}/objects`);
-      const data = await response.json();
-      setObjects(data);
+      const data = await apiFetch(`/instances/${instanceId}/objects`);
+      setObjects(formatMissingLabel(data));
     } catch (error) {
       console.error('Error loading objects:', error);
     } finally {
@@ -40,12 +67,50 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
   const loadFields = async (instanceId, objectName) => {
     if (!instanceId || !objectName) return;
     try {
-      const response = await fetch(`${API_BASE}/instances/${instanceId}/objects/${objectName}/fields`);
-      const data = await response.json();
-      setFields(data);
+      const data = await apiFetch(`/instances/${instanceId}/objects/${objectName}/fields`);
+      setFields(formatMissingLabel(data));
     } catch (error) {
       console.error('Error loading fields:', error);
     }
+  };
+
+  // Enhanced cron pattern generator
+  const getPattern = () => {
+    if (formData.scheduleType === 'hourly') {
+      return '0 * * * *';
+    } else if (formData.scheduleType === 'everyXMinutes') {
+      return `*/${formData.everyX} * * * *`;
+    } else if (formData.scheduleType === 'everyXHours') {
+      return `0 */${formData.everyX} * * *`;
+    } else if (formData.scheduleType === 'daily') {
+      const [h, m] = formData.time.split(':');
+      return `${parseInt(m, 10)} ${parseInt(h, 10)} * * *`;
+    } else if (formData.scheduleType === 'alternateDay') {
+      const [h, m] = formData.time.split(':');
+      return `${parseInt(m, 10)} ${parseInt(h, 10)} */${formData.alternate} * *`;
+    } else if (formData.scheduleType === 'weekly') {
+      const [h, m] = formData.time.split(':');
+      return `${parseInt(m, 10)} ${parseInt(h, 10)} * * ${formData.dayOfWeek}`;
+    } else if (formData.scheduleType === 'alternateWeek') {
+      const [h, m] = formData.time.split(':');
+      // Not standard cron, but simulate: run on Monday every N weeks
+      return `${parseInt(m, 10)} ${parseInt(h, 10)} * * 1/${formData.alternate}`;
+    } else if (formData.scheduleType === 'monthly') {
+      const [h, m] = formData.time.split(':');
+      return `${parseInt(m, 10)} ${parseInt(h, 10)} ${formData.dayOfMonth} * *`;
+    } else if (formData.scheduleType === 'alternateMonth') {
+      const [h, m] = formData.time.split(':');
+      return `${parseInt(m, 10)} ${parseInt(h, 10)} 1 */${formData.alternate} *`;
+    } else if (formData.scheduleType === 'quarterly') {
+      const [h, m] = formData.time.split(':');
+      return `${parseInt(m, 10)} ${parseInt(h, 10)} 1 1,4,7,10 *`;
+    } else if (formData.scheduleType === 'yearly') {
+      const [h, m] = formData.time.split(':');
+      return `${parseInt(m, 10)} ${parseInt(h, 10)} 1 1 *`;
+    } else if (formData.scheduleType === 'custom') {
+      return formData.customPattern.trim();
+    }
+    return '';
   };
 
   const handleSubmit = async (e) => {
@@ -53,13 +118,26 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
     try {
       const selectedFieldObjs = fields.filter(f => formData.fields.includes(f.name));
       const url = editingSchedule
-        ? `${API_BASE}/schedules/${editingSchedule.id}`
-        : `${API_BASE}/schedules`;
+        ? `/schedules/${editingSchedule.id}`
+        : `/schedules`;
       const method = editingSchedule ? 'PUT' : 'POST';
-      await fetch(url, {
+      const pattern = getPattern();
+      if (!pattern) throw new Error('Invalid schedule pattern');
+      await apiFetch(url, {
         method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...formData, fields: selectedFieldObjs })
+        body: JSON.stringify({
+          ...formData,
+          fields: selectedFieldObjs,
+          pattern,
+          // Remove UI-only fields
+          scheduleType: undefined,
+          dayOfWeek: undefined,
+          dayOfMonth: undefined,
+          customPattern: undefined,
+          time: undefined,
+          everyX: undefined,
+          alternate: undefined
+        })
       });
       setShowForm(false);
       setEditingSchedule(null);
@@ -68,36 +146,88 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
         objectName: '',
         fields: [],
         targetDatabase: 'postgres',
-        frequency: 'daily',
+        scheduleType: 'hourly',
         time: '00:00',
+        dayOfWeek: '1',
+        dayOfMonth: '1',
+        customPattern: '',
+        everyX: '15',
+        alternate: '2',
         active: true
       });
       onReload();
     } catch (error) {
-      console.error('Error saving schedule:', error);
+      alert(error.message || 'Error saving schedule');
     }
   };
 
-  const handleEdit = (schedule) => {
+  // Enhanced edit logic for retaining instance/object/fields
+  const handleEdit = async (schedule) => {
+    setEditLoading(true);
     setEditingSchedule(schedule);
-    setFormData({
+    // Set instanceId first
+    setFormData(f => ({
+      ...f,
       instanceId: schedule.instanceId,
-      objectName: schedule.objectName,
-      fields: schedule.fields,
-      targetDatabase: schedule.targetDatabase,
-      frequency: schedule.frequency,
-      time: schedule.time.split(' ')[0],
+      scheduleType: 'hourly', // will be set below
+      time: '00:00',
+      dayOfWeek: '1',
+      dayOfMonth: '1',
+      customPattern: '',
+      everyX: '15',
+      alternate: '2',
       active: schedule.active
-    });
-    loadObjects(schedule.instanceId);
-    loadFields(schedule.instanceId, schedule.objectName);
+    }));
+    // Load objects for instance
+    await loadObjects(schedule.instanceId);
+    // Set objectName
+    setFormData(f => ({ ...f, objectName: schedule.objectName }));
+    // Load fields for object
+    await loadFields(schedule.instanceId, schedule.objectName);
+    // Set fields
+    setFormData(f => ({ ...f, fields: schedule.fields }));
+    // Parse cron pattern to UI fields
+    let scheduleType = 'custom', time = '00:00', dayOfWeek = '1', dayOfMonth = '1', customPattern = schedule.pattern || '', everyX = '15', alternate = '2';
+    if (schedule.pattern === '0 * * * *') {
+      scheduleType = 'hourly';
+    } else {
+      const parts = (schedule.pattern || '').split(' ');
+      if (parts.length === 5) {
+        if (parts[0].startsWith('*/')) { scheduleType = 'everyXMinutes'; everyX = parts[0].slice(2); }
+        else if (parts[1].startsWith('*/')) { scheduleType = 'everyXHours'; everyX = parts[1].slice(2); }
+        else if (parts[2].startsWith('*/')) { scheduleType = 'alternateDay'; alternate = parts[2].slice(2); }
+        else if (parts[4].includes('/')) { scheduleType = 'alternateWeek'; alternate = parts[4].split('/')[1]; }
+        else if (parts[3].includes('/')) { scheduleType = 'alternateMonth'; alternate = parts[3].split('/')[1]; }
+        else if (parts[2] === '*' && parts[4] === '*') scheduleType = 'daily';
+        else if (parts[2] === '*' && parts[4] !== '*') scheduleType = 'weekly';
+        else if (parts[2] !== '*' && parts[4] === '*') scheduleType = 'monthly';
+        else if (parts[2] === '1' && ['1','4','7','10'].includes(parts[3])) scheduleType = 'quarterly';
+        else if (parts[2] === '1' && parts[3] === '1') scheduleType = 'yearly';
+        if (scheduleType !== 'custom') {
+          time = `${parts[1].padStart(2, '0')}:${parts[0].padStart(2, '0')}`;
+          if (scheduleType === 'weekly') dayOfWeek = parts[4];
+          if (scheduleType === 'monthly') dayOfMonth = parts[2];
+        }
+      }
+    }
+    setFormData(f => ({
+      ...f,
+      scheduleType,
+      time,
+      dayOfWeek,
+      dayOfMonth,
+      customPattern,
+      everyX,
+      alternate
+    }));
     setShowForm(true);
+    setEditLoading(false);
   };
 
   const handleDelete = async (id) => {
     if (confirm('Are you sure you want to delete this schedule?')) {
       try {
-        await fetch(`${API_BASE}/schedules/${id}`, { method: 'DELETE' });
+        await apiFetch(`/schedules/${id}`, { method: 'DELETE' });
         onReload();
       } catch (error) {
         console.error('Error deleting schedule:', error);
@@ -107,7 +237,7 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
 
   const toggleSchedule = async (id) => {
     try {
-      await fetch(`${API_BASE}/schedules/${id}/toggle`, { method: 'POST' });
+      await apiFetch(`/schedules/${id}/toggle`, { method: 'POST' });
       onReload();
     } catch (error) {
       console.error('Error toggling schedule:', error);
@@ -137,6 +267,25 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
 
   const selectedInstanceObj = instances.find(i => i.id === formData.instanceId);
 
+  // Load fields when object or instance changes
+  useEffect(() => {
+    if (formData.instanceId && formData.objectName) {
+      loadFields(formData.instanceId, formData.objectName);
+    } else {
+      setFields([]);
+    }
+    // eslint-disable-next-line
+  }, [formData.instanceId, formData.objectName]);
+
+  // Live cron summary using cronstrue
+  const pattern = getPattern();
+  let summary = '';
+  try {
+    summary = cronstrue.toString(pattern, { throwExceptionOnParseError: false });
+  } catch {
+    summary = 'Invalid cron pattern';
+  }
+
   return (
     <div>
       <div className="flex justify-between items-center mb-6">
@@ -154,7 +303,6 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
           <h3 className="text-lg font-medium mb-4">
             {editingSchedule ? 'Edit Schedule' : 'Add New Schedule'}
           </h3>
-          {/* Show object/field counts if present */}
           <div className="flex space-x-6 mb-4">
             {objects.length > 0 && (
               <span className="text-sm text-gray-600">Objects: <b>{objects.length}</b></span>
@@ -163,7 +311,6 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
               <span className="text-sm text-gray-600">Fields: <b>{fields.length}</b></span>
             )}
           </div>
-          {/* Show selected instance DB config */}
           {selectedInstanceObj && (
             <div className="mb-4 p-3 bg-gray-50 border rounded">
               <div className="text-xs text-gray-500 mb-1">Target Database for this Instance:</div>
@@ -196,48 +343,133 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
             )}
                 </label>
               <ObjectSelect
-  objects={objects}
-  value={formData.objectName}
-  onChange={objectName => setFormData(prev => ({ ...prev, objectName, fields: [] }))}
-  label="Object"
-/>
+                objects={objects}
+                value={formData.objectName}
+                onChange={objectName => setFormData(prev => ({ ...prev, objectName, fields: [] }))}
+                label="Object"
+              />
 
-{/*!loadingObjects && objects.length === 0 && (
-  <p className="mt-1 text-sm text-gray-500">
-    No objects found for this instance
-  </p>
-)*/}
+              {/*!loadingObjects && objects.length === 0 && (
+                <p className="mt-1 text-sm text-gray-500">
+                  No objects found for this instance
+                </p>
+              )*/}
             </div>
 
             <FieldMultiSelect
-  fields={fields}
-  selectedFields={formData.fields}
-  onChange={fieldsArr => setFormData(prev => ({ ...prev, fields: fieldsArr }))}
-  label="Fields"
-/>
+              fields={fields}
+              selectedFields={formData.fields}
+              onChange={fieldsArr => setFormData(prev => ({ ...prev, fields: fieldsArr }))}
+              label="Fields"
+            />
 
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Frequency</label>
+            <div className="col-span-2">
+              <label className="block text-sm font-medium text-gray-700 mb-1">Schedule</label>
+              <div className="flex flex-col space-y-2">
               <select
-                value={formData.frequency}
-                onChange={(e) => setFormData({ ...formData, frequency: e.target.value })}
-                className="w-full border border-gray-300 rounded-md px-3 py-2"
-              >
-                <option value="hourly">Hourly</option>
-                <option value="daily">Daily</option>
-                <option value="weekly">Weekly</option>
-                <option value="monthly">Monthly</option>
+                  value={formData.scheduleType}
+                  onChange={e => setFormData(f => ({ ...f, scheduleType: e.target.value }))}
+                  className="border rounded px-2 py-1 w-full max-w-xs mb-2"
+                >
+                  {SCHEDULE_TYPES.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+                {formData.scheduleType === 'everyXMinutes' && (
+                  <div className="flex items-center space-x-2">
+                    <span>Every</span>
+                    <input type="number" min="1" max="59" value={formData.everyX} onChange={e => setFormData(f => ({ ...f, everyX: e.target.value }))} className="border rounded px-2 py-1 w-16" />
+                    <span>minutes</span>
+                  </div>
+                )}
+                {formData.scheduleType === 'everyXHours' && (
+                  <div className="flex items-center space-x-2">
+                    <span>Every</span>
+                    <input type="number" min="1" max="23" value={formData.everyX} onChange={e => setFormData(f => ({ ...f, everyX: e.target.value }))} className="border rounded px-2 py-1 w-16" />
+                    <span>hours</span>
+                  </div>
+                )}
+                {formData.scheduleType === 'daily' && (
+                  <div className="flex items-center space-x-2">
+                    <span>At</span>
+                    <input type="time" value={formData.time} onChange={e => setFormData(f => ({ ...f, time: e.target.value }))} className="border rounded px-2 py-1" />
+                  </div>
+                )}
+                {formData.scheduleType === 'alternateDay' && (
+                  <div className="flex items-center space-x-2">
+                    <span>Every</span>
+                    <input type="number" min="2" max="31" value={formData.alternate} onChange={e => setFormData(f => ({ ...f, alternate: e.target.value }))} className="border rounded px-2 py-1 w-16" />
+                    <span>days at</span>
+                    <input type="time" value={formData.time} onChange={e => setFormData(f => ({ ...f, time: e.target.value }))} className="border rounded px-2 py-1" />
+                  </div>
+                )}
+                {formData.scheduleType === 'weekly' && (
+                  <div className="flex items-center space-x-2">
+                    <span>On</span>
+                    <select value={formData.dayOfWeek} onChange={e => setFormData(f => ({ ...f, dayOfWeek: e.target.value }))} className="border rounded px-2 py-1">
+                      <option value="0">Sunday</option>
+                      <option value="1">Monday</option>
+                      <option value="2">Tuesday</option>
+                      <option value="3">Wednesday</option>
+                      <option value="4">Thursday</option>
+                      <option value="5">Friday</option>
+                      <option value="6">Saturday</option>
               </select>
+                    <span>at</span>
+                    <input type="time" value={formData.time} onChange={e => setFormData(f => ({ ...f, time: e.target.value }))} className="border rounded px-2 py-1" />
+                  </div>
+                )}
+                {formData.scheduleType === 'alternateWeek' && (
+                  <div className="flex items-center space-x-2">
+                    <span>Every</span>
+                    <input type="number" min="2" max="12" value={formData.alternate} onChange={e => setFormData(f => ({ ...f, alternate: e.target.value }))} className="border rounded px-2 py-1 w-16" />
+                    <span>weeks (on Monday) at</span>
+                    <input type="time" value={formData.time} onChange={e => setFormData(f => ({ ...f, time: e.target.value }))} className="border rounded px-2 py-1" />
+                  </div>
+                )}
+                {formData.scheduleType === 'monthly' && (
+                  <div className="flex items-center space-x-2">
+                    <span>On day</span>
+                    <input type="number" min="1" max="31" value={formData.dayOfMonth} onChange={e => setFormData(f => ({ ...f, dayOfMonth: e.target.value }))} className="border rounded px-2 py-1 w-16" />
+                    <span>at</span>
+                    <input type="time" value={formData.time} onChange={e => setFormData(f => ({ ...f, time: e.target.value }))} className="border rounded px-2 py-1" />
+                  </div>
+                )}
+                {formData.scheduleType === 'alternateMonth' && (
+                  <div className="flex items-center space-x-2">
+                    <span>Every</span>
+                    <input type="number" min="2" max="12" value={formData.alternate} onChange={e => setFormData(f => ({ ...f, alternate: e.target.value }))} className="border rounded px-2 py-1 w-16" />
+                    <span>months (on 1st) at</span>
+                    <input type="time" value={formData.time} onChange={e => setFormData(f => ({ ...f, time: e.target.value }))} className="border rounded px-2 py-1" />
+                  </div>
+                )}
+                {formData.scheduleType === 'quarterly' && (
+                  <div className="flex items-center space-x-2">
+                    <span>Quarterly (Jan/Apr/Jul/Oct 1st) at</span>
+                    <input type="time" value={formData.time} onChange={e => setFormData(f => ({ ...f, time: e.target.value }))} className="border rounded px-2 py-1" />
+                  </div>
+                )}
+                {formData.scheduleType === 'yearly' && (
+                  <div className="flex items-center space-x-2">
+                    <span>Yearly (Jan 1st) at</span>
+                    <input type="time" value={formData.time} onChange={e => setFormData(f => ({ ...f, time: e.target.value }))} className="border rounded px-2 py-1" />
             </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Time</label>
+                )}
+                {formData.scheduleType === 'custom' && (
+                  <div className="flex items-center space-x-2">
+                    <span>Cron pattern</span>
               <input
-                type="time"
-                value={formData.time}
-                onChange={(e) => setFormData({ ...formData, time: e.target.value })}
-                className="w-full border border-gray-300 rounded-md px-3 py-2"
-              />
+                      type="text"
+                      value={formData.customPattern}
+                      onChange={e => setFormData(f => ({ ...f, customPattern: autoFormatCronInput(e.target.value) }))}
+                      className="ml-2 border rounded px-2 py-1 flex-1"
+                      placeholder="* * * * *"
+                    />
+                    <span className="ml-2 text-xs text-gray-500">(min hour day month weekDay)</span>
+                  </div>
+                )}
+                <div className="text-xs text-blue-700 mt-2">{summary}</div>
+              </div>
             </div>
 
             <div className="col-span-2 flex items-center">
@@ -274,6 +506,7 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
           </form>
         </div>
       )}
+      {editLoading && <div className="p-4 text-center text-blue-600">Loading schedule for edit...</div>}
 
       <div className="bg-white rounded-lg shadow overflow-hidden">
         <table className="min-w-full divide-y divide-gray-200">
@@ -299,7 +532,7 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{schedule.objectName}</td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{schedule.targetDatabase}</td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                      {schedule.frequency} at {schedule.time}
+                      {schedule.pattern ? new Date(schedule.pattern).toLocaleString() : 'N/A'}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm">
                       <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${
@@ -350,4 +583,4 @@ const SchedulesTab = ({ schedules, instances, onReload }) => {
   );
 };
 
-export default SchedulesTab; 
+export default SchedulesTab;
